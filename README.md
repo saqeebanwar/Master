@@ -1,118 +1,53 @@
-#!/bin/sh
+#!/bin/bash
 
-KUBE_VERSION=1.28.2
+set -e
 
-### setup terminal
-apt-get --allow-unauthenticated update
-apt-get --allow-unauthenticated install -y bash-completion binutils
-echo 'colorscheme ron' >> ~/.vimrc
-echo 'set tabstop=2' >> ~/.vimrc
-echo 'set shiftwidth=2' >> ~/.vimrc
-echo 'set expandtab' >> ~/.vimrc
-echo 'source <(kubectl completion bash)' >> ~/.bashrc
-echo 'alias k=kubectl' >> ~/.bashrc
-echo 'alias c=clear' >> ~/.bashrc
-echo 'complete -F __start_kubectl k' >> ~/.bashrc
-sed -i '1s/^/force_color_prompt=yes\n/' ~/.bashrc
+KUBE_VERSION="1.28.2"
 
-### disable linux swap and remove any existing swap partitions
+echo "[Step 1] Updating system and installing dependencies..."
+apt-get update && apt-get install -y apt-transport-https ca-certificates curl gpg lsb-release bash-completion
+
+echo "[Step 2] Disabling swap..."
 swapoff -a
-sed -i '/\sswap\s/ s/^\(.*\)$/#\1/g' /etc/fstab
+sed -i '/ swap / s/^/#/' /etc/fstab
 
-### remove packages
-kubeadm reset -f || true
-crictl rm --force $(crictl ps -a -q) || true
-apt-mark unhold kubelet kubeadm kubectl kubernetes-cni || true
-apt-get remove -y docker.io containerd kubelet kubeadm kubectl kubernetes-cni || true
-apt-get autoremove -y
-systemctl daemon-reload
-
-### install podman
-. /etc/os-release
-echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/ /" | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:testing.list
-curl -L "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/Release.key" | sudo apt-key add -
-apt-get update -qq
-apt-get -qq -y install podman cri-tools containers-common
-rm /etc/apt/sources.list.d/devel:kubic:libcontainers:testing.list
-cat <<EOF | sudo tee /etc/containers/registries.conf
-[registries.search]
-registries = ['docker.io']
-EOF
-
-### install packages
-curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
-echo "deb [trusted=yes] https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
-apt-get --allow-unauthenticated update
-apt-get --allow-unauthenticated install -y docker.io containerd kubelet=${KUBE_VERSION}-00 kubeadm=${KUBE_VERSION}-00 kubectl=${KUBE_VERSION}-00 kubernetes-cni
-apt-mark hold kubelet kubeadm kubectl kubernetes-cni
-
-### install containerd 1.6 over apt-installed-version
-wget https://github.com/containerd/containerd/releases/download/v1.6.22/containerd-1.6.22-linux-amd64.tar.gz
-tar xvf containerd-1.6.22-linux-amd64.tar.gz
-systemctl stop containerd
-mv bin/* /usr/bin
-rm -rf bin containerd-1.6.22-linux-amd64.tar.gz
-systemctl unmask containerd
-systemctl start containerd
-
-### containerd
-cat <<EOF | sudo tee /etc/modules-load.d/containerd.conf
+echo "[Step 3] Loading kernel modules..."
+cat <<EOF | tee /etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
 EOF
-sudo modprobe overlay
-sudo modprobe br_netfilter
-cat <<EOF | sudo tee /etc/sysctl.d/99-kubernetes-cri.conf
-net.bridge.bridge-nf-call-iptables  = 1
-net.ipv4.ip_forward                 = 1
+modprobe overlay
+modprobe br_netfilter
+
+echo "[Step 4] Applying sysctl params..."
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
 EOF
-sudo sysctl --system
-sudo mkdir -p /etc/containerd
+sysctl --system
 
-### containerd config
-cat > /etc/containerd/config.toml <<EOF
-version = 2
-
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-  SystemdCgroup = true
-EOF
-
-### crictl uses containerd as default
-cat <<EOF | sudo tee /etc/crictl.yaml
-runtime-endpoint: unix:///run/containerd/containerd.sock
-EOF
-
-### kubelet should use containerd
-cat <<EOF | sudo tee /etc/default/kubelet
-KUBELET_EXTRA_ARGS="--container-runtime remote --container-runtime-endpoint unix:///run/containerd/containerd.sock"
-EOF
-
-### start services
-systemctl daemon-reload
-systemctl enable containerd
+echo "[Step 5] Installing containerd..."
+apt-get install -y containerd
+mkdir -p /etc/containerd
+containerd config default | tee /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl restart containerd
-systemctl enable kubelet && systemctl start kubelet
+systemctl enable containerd
 
-### init k8s
-rm /root/.kube/config || true
-kubeadm init --kubernetes-version=${KUBE_VERSION} --ignore-preflight-errors=NumCPU --skip-token-print --pod-network-cidr=192.168.0.0/16
+echo "[Step 6] Adding Kubernetes apt repo..."
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
 
-mkdir -p ~/.kube
-sudo cp -i /etc/kubernetes/admin.conf ~/.kube/config
+echo "[Step 7] Installing Kubernetes components..."
+apt-get update
+apt-get install -y kubelet=${KUBE_VERSION}-1.1 kubeadm=${KUBE_VERSION}-1.1 kubectl=${KUBE_VERSION}-1.1
+apt-mark hold kubelet kubeadm kubectl
 
-### CNI - Calico (updated for Kubernetes 1.28)
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+echo "[Step 8] Enabling kubelet service..."
+systemctl enable kubelet
+systemctl start kubelet
 
-### etcdctl
-ETCDCTL_VERSION=v3.5.10
-ETCDCTL_ARCH=$(dpkg --print-architecture)
-ETCDCTL_VERSION_FULL=etcd-${ETCDCTL_VERSION}-linux-${ETCDCTL_ARCH}
-wget https://github.com/etcd-io/etcd/releases/download/${ETCDCTL_VERSION}/${ETCDCTL_VERSION_FULL}.tar.gz
-tar xzf ${ETCDCTL_VERSION_FULL}.tar.gz ${ETCDCTL_VERSION_FULL}/etcdctl
-mv ${ETCDCTL_VERSION_FULL}/etcdctl /usr/bin/
-rm -rf ${ETCDCTL_VERSION_FULL} ${ETCDCTL_VERSION_FULL}.tar.gz
-
-echo
-echo "### COMMAND TO ADD A WORKER NODE ###"
-kubeadm token create --print-join-command --ttl 0
+echo "[✅] Kubernetes ${KUBE_VERSION} with containerd installed!"
+echo "You can now run: kubeadm init --pod-network-cidr=192.168.0.0/16"
